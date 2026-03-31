@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>RAG Query Flow</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      background: #f8f9fa;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+    }
+    h1 { color: #333; margin-bottom: 1.5rem; }
+    .diagram-container {
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+      padding: 2rem;
+      max-width: 960px;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <h1>RAG Chatbot — Query Flow</h1>
+  <div class="diagram-container">
+    <div class="mermaid">
+sequenceDiagram
+    actor User
+    participant FE as Frontend<br/>(script.js)
+    participant API as FastAPI<br/>(app.py)
+    participant RAG as RAGSystem<br/>(rag_system.py)
+    participant SM as SessionManager<br/>(session_manager.py)
+    participant AI as AIGenerator<br/>(ai_generator.py)
+    participant Claude as Claude API
+    participant TM as ToolManager<br/>(search_tools.py)
+    participant VS as VectorStore<br/>(vector_store.py)
+
+    User->>FE: Types message, hits Enter / Send
+    FE->>FE: Show loading spinner
+    FE->>API: POST /api/query<br/>{ query, session_id }
+
+    API->>SM: create_session() if no session_id
+    SM-->>API: session_id
+
+    API->>RAG: query(query, session_id)
+
+    RAG->>SM: get_conversation_history(session_id)
+    SM-->>RAG: history (last 2 exchanges)
+
+    RAG->>AI: generate_response(query, history, tools)
+
+    AI->>Claude: API call #1<br/>system: prompt + history<br/>user: query<br/>tools: search_course_content<br/>tool_choice: auto
+
+    alt Claude decides to search
+        Claude-->>AI: stop_reason = "tool_use"<br/>tool: search_course_content(query, course_name?, lesson_number?)
+
+        AI->>TM: execute_tool("search_course_content", ...)
+
+        TM->>VS: search(query, course_name, lesson_number)
+
+        opt course_name provided
+            VS->>VS: course_catalog.query(course_name)<br/>→ resolve fuzzy name to exact title
+        end
+
+        VS->>VS: course_content.query(embedded_query)<br/>with where filter (course + lesson)
+        VS-->>TM: top-5 matching chunks + metadata
+
+        TM->>TM: format results<br/>store sources list
+        TM-->>AI: formatted chunk text
+
+        AI->>Claude: API call #2<br/>messages: [user, assistant(tool_use), user(tool_result)]<br/>no tools this time
+
+        Claude-->>AI: final answer (grounded in chunks)
+    else Claude answers directly
+        Claude-->>AI: stop_reason = "end_turn"<br/>answer text
+    end
+
+    AI-->>RAG: answer text
+
+    RAG->>TM: get_last_sources()
+    TM-->>RAG: ["Course - Lesson N", ...]
+    RAG->>TM: reset_sources()
+
+    RAG->>SM: add_exchange(session_id, query, answer)
+
+    RAG-->>API: (answer, sources)
+    API-->>FE: { answer, sources, session_id }
+
+    FE->>FE: Remove loading spinner
+    FE->>FE: Render markdown answer<br/>+ collapsible Sources section
+    FE-->>User: Displays response
+    </div>
+  </div>
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: 'default', sequence: { actorMargin: 60 } });
+  </script>
+</body>
+</html>

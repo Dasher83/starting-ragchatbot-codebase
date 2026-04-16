@@ -253,21 +253,24 @@ class TestToolUsePath:
         assert tool_result["tool_use_id"] == "toolu_abc"
         assert tool_result["content"] == "Relevant content from lesson 5."
 
-    def test_second_api_call_has_no_tools_parameter(self):
+    def test_mid_loop_api_call_includes_tools(self):
+        """After one tool round the mid-loop call still carries tools so Claude can
+        decide whether to invoke another tool or answer directly."""
         generator, mock_client = build_generator()
         first = make_tool_use_response("search_course_content", {"query": "lesson 5"})
         second = make_text_response("Answer.")
         mock_client.messages.create.side_effect = [first, second]
 
-        generator.generate_response(
+        result = generator.generate_response(
             query="Lesson query?",
             tools=SAMPLE_TOOLS,
             tool_manager=make_tool_manager(),
         )
 
+        assert result == "Answer."
         second_call_kwargs = mock_client.messages.create.call_args_list[1].kwargs
-        assert "tools" not in second_call_kwargs
-        assert "tool_choice" not in second_call_kwargs
+        assert "tools" in second_call_kwargs
+        assert second_call_kwargs["tool_choice"] == {"type": "auto"}
 
     def test_no_tool_call_when_tool_manager_is_none(self):
         """If tool_manager is None, tool_use response falls through to content[0].text."""
@@ -324,3 +327,146 @@ class TestEdgeCases:
 
         with pytest.raises(ValueError, match="Unexpected response from Claude API"):
             generator.generate_response(query="Hello?")
+
+
+# ---------------------------------------------------------------------------
+# Tests: sequential tool calling (up to 2 rounds)
+# ---------------------------------------------------------------------------
+
+class TestSequentialToolCalling:
+
+    def test_two_tool_rounds_three_api_calls(self):
+        """Two sequential tool rounds produce 3 API calls and 2 tool executions."""
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("get_course_outline", {"course_title": "MCP"}, tool_id="toolu_001")
+        second = make_tool_use_response("search_course_content", {"query": "tool calling"}, tool_id="toolu_002")
+        third = make_text_response("Here is the complete answer.")
+        mock_client.messages.create.side_effect = [first, second, third]
+
+        result = generator.generate_response(
+            query="Find a course discussing the same topic as lesson 4 of MCP.",
+            tools=SAMPLE_TOOLS,
+            tool_manager=make_tool_manager(),
+        )
+
+        assert mock_client.messages.create.call_count == 3
+        assert make_tool_manager().execute_tool.call_count == 0  # sanity — real tm below
+        tm = make_tool_manager()
+        mock_client.messages.create.side_effect = [first, second, third]
+        generator.generate_response(
+            query="Find a course discussing the same topic as lesson 4 of MCP.",
+            tools=SAMPLE_TOOLS,
+            tool_manager=tm,
+        )
+        assert tm.execute_tool.call_count == 2
+        assert result == "Here is the complete answer."
+
+    def test_two_tool_rounds_tools_present_in_mid_calls_absent_in_synthesis(self):
+        """Tools are included in the first two API calls, excluded in the final synthesis."""
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("get_course_outline", {"course_title": "MCP"}, tool_id="toolu_001")
+        second = make_tool_use_response("search_course_content", {"query": "tool calling"}, tool_id="toolu_002")
+        third = make_text_response("Final answer.")
+        mock_client.messages.create.side_effect = [first, second, third]
+
+        generator.generate_response(
+            query="Multi-step query.",
+            tools=SAMPLE_TOOLS,
+            tool_manager=make_tool_manager(),
+        )
+
+        call_list = mock_client.messages.create.call_args_list
+        assert "tools" in call_list[0].kwargs          # initial call
+        assert "tools" in call_list[1].kwargs          # mid-loop round-2 call
+        assert "tools" not in call_list[2].kwargs      # final synthesis
+        assert "tool_choice" not in call_list[2].kwargs
+
+    def test_single_tool_round_claude_answers_directly(self):
+        """When Claude answers directly after 1 tool round, exactly 2 API calls are made."""
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("search_course_content", {"query": "lesson 5"})
+        second = make_text_response("Lesson 5 covered tool calling.")
+        mock_client.messages.create.side_effect = [first, second]
+
+        result = generator.generate_response(
+            query="What was in lesson 5?",
+            tools=SAMPLE_TOOLS,
+            tool_manager=make_tool_manager(),
+        )
+
+        assert mock_client.messages.create.call_count == 2
+        assert result == "Lesson 5 covered tool calling."
+
+    def test_max_rounds_cap_enforced(self):
+        """Even if Claude keeps requesting tools, execute_tool is called at most MAX_TOOL_ROUNDS times."""
+        generator, mock_client = build_generator()
+        # Supply more tool_use responses than MAX_TOOL_ROUNDS would allow
+        r1 = make_tool_use_response("get_course_outline", {"course_title": "A"}, tool_id="toolu_001")
+        r2 = make_tool_use_response("search_course_content", {"query": "topic"}, tool_id="toolu_002")
+        r3 = make_tool_use_response("search_course_content", {"query": "more"}, tool_id="toolu_003")
+        synthesis = make_text_response("Capped answer.")
+        mock_client.messages.create.side_effect = [r1, r2, r3, synthesis]
+
+        tm = make_tool_manager()
+        generator.generate_response(
+            query="Multi-step query.",
+            tools=SAMPLE_TOOLS,
+            tool_manager=tm,
+        )
+
+        assert tm.execute_tool.call_count == generator.MAX_TOOL_ROUNDS
+
+    def test_tool_execution_error_terminates_loop_gracefully(self):
+        """A tool execution exception ends the loop and a synthesis call is still made."""
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("search_course_content", {"query": "lesson 5"}, tool_id="toolu_err")
+        synthesis = make_text_response("I was unable to retrieve that information.")
+        mock_client.messages.create.side_effect = [first, synthesis]
+
+        tm = MagicMock()
+        tm.execute_tool.side_effect = RuntimeError("DB unavailable")
+
+        result = generator.generate_response(
+            query="What was in lesson 5?",
+            tools=SAMPLE_TOOLS,
+            tool_manager=tm,
+        )
+
+        assert mock_client.messages.create.call_count == 2
+        assert result == "I was unable to retrieve that information."
+
+        # Synthesis call messages must contain an is_error tool_result
+        synthesis_kwargs = mock_client.messages.create.call_args_list[1].kwargs
+        messages = synthesis_kwargs["messages"]
+        error_result = None
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("is_error"):
+                        error_result = item
+        assert error_result is not None
+        assert error_result["tool_use_id"] == "toolu_err"
+
+    def test_message_alternation_after_two_rounds(self):
+        """After 2 tool rounds the synthesis call receives properly alternating messages."""
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("get_course_outline", {"course_title": "MCP"}, tool_id="toolu_001")
+        second = make_tool_use_response("search_course_content", {"query": "topic"}, tool_id="toolu_002")
+        third = make_text_response("Final.")
+        mock_client.messages.create.side_effect = [first, second, third]
+
+        generator.generate_response(
+            query="Multi-step query.",
+            tools=SAMPLE_TOOLS,
+            tool_manager=make_tool_manager(),
+        )
+
+        synthesis_messages = mock_client.messages.create.call_args_list[2].kwargs["messages"]
+        # Expected: [user_query, assistant_round1, user_results1, assistant_round2, user_results2]
+        assert len(synthesis_messages) == 5
+        assert synthesis_messages[0]["role"] == "user"
+        assert synthesis_messages[1]["role"] == "assistant"
+        assert synthesis_messages[2]["role"] == "user"
+        assert synthesis_messages[3]["role"] == "assistant"
+        assert synthesis_messages[4]["role"] == "user"

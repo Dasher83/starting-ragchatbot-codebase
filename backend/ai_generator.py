@@ -84,8 +84,13 @@ Provide only the direct answer to what was asked.
         # Handle tool execution if needed
         if response.stop_reason == "tool_use" and tool_manager:
             return self._handle_tool_execution(response, api_params, tool_manager)
-        
+
         # Return direct response
+        if not response.content or not hasattr(response.content[0], "text"):
+            raise ValueError(
+                f"Unexpected response from Claude API (stop_reason={response.stop_reason!r}, "
+                f"content_length={len(response.content)})"
+            )
         return response.content[0].text
     
     def _handle_tool_execution(self, initial_response, base_params: Dict[str, Any], tool_manager):
@@ -134,4 +139,10 @@ Provide only the direct answer to what was asked.
         
         # Get final response
         final_response = self.client.messages.create(**final_params)
+        if not final_response.content or not hasattr(final_response.content[0], "text"):
+            raise ValueError(
+                f"Unexpected response from Claude API after tool use "
+                f"(stop_reason={final_response.stop_reason!r}, "
+                f"content_length={len(final_response.content)})"
+            )
         return final_response.content[0].text

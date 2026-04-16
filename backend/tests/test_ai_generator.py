@@ -1,0 +1,326 @@
+"""
+Tests for AIGenerator.generate_response() and _handle_tool_execution()
+in ai_generator.py.
+
+Mocking strategy: patch 'ai_generator.anthropic.Anthropic' so the real SDK
+client is never constructed. Fake Message/ContentBlock objects are plain
+MagicMocks with the required attributes (stop_reason, content, type, text,
+id, name, input).
+"""
+
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from unittest.mock import MagicMock, patch, call
+import pytest
+
+from ai_generator import AIGenerator
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def make_text_block(text="The answer."):
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+    return block
+
+
+def make_tool_use_block(tool_name, tool_input, tool_id="toolu_001"):
+    block = MagicMock()
+    block.type = "tool_use"
+    block.id = tool_id
+    block.name = tool_name
+    block.input = tool_input
+    return block
+
+
+def make_text_response(text="The answer."):
+    response = MagicMock()
+    response.stop_reason = "end_turn"
+    response.content = [make_text_block(text)]
+    return response
+
+
+def make_tool_use_response(tool_name, tool_input, tool_id="toolu_001"):
+    response = MagicMock()
+    response.stop_reason = "tool_use"
+    response.content = [make_tool_use_block(tool_name, tool_input, tool_id)]
+    return response
+
+
+def build_generator():
+    """Return (AIGenerator instance, mock_client) without touching the real SDK."""
+    with patch("ai_generator.anthropic.Anthropic") as mock_cls:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        generator = AIGenerator(api_key="test-key", model="claude-sonnet-4-20250514")
+    # The patch is gone but generator.client already holds mock_client
+    return generator, mock_client
+
+
+def make_tool_manager(tool_result="Search results."):
+    tm = MagicMock()
+    tm.execute_tool.return_value = tool_result
+    return tm
+
+
+SAMPLE_TOOLS = [
+    {"name": "search_course_content", "description": "Search content", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_course_outline", "description": "Get outline", "input_schema": {"type": "object", "properties": {}}},
+]
+
+
+# ---------------------------------------------------------------------------
+# Tests: direct-answer path (no tool use)
+# ---------------------------------------------------------------------------
+
+class TestDirectAnswerPath:
+
+    def test_returns_text_from_content_block(self):
+        generator, mock_client = build_generator()
+        mock_client.messages.create.return_value = make_text_response("Direct answer here.")
+
+        result = generator.generate_response(query="What is machine learning?")
+
+        assert result == "Direct answer here."
+
+    def test_only_one_api_call_when_no_tool_used(self):
+        generator, mock_client = build_generator()
+        mock_client.messages.create.return_value = make_text_response("Answer.")
+
+        generator.generate_response(query="General question?")
+
+        assert mock_client.messages.create.call_count == 1
+
+    def test_query_appears_in_messages(self):
+        generator, mock_client = build_generator()
+        mock_client.messages.create.return_value = make_text_response("Answer.")
+
+        generator.generate_response(query="What is RAG?")
+
+        call_kwargs = mock_client.messages.create.call_args.kwargs
+        messages = call_kwargs["messages"]
+        user_message = next(m for m in messages if m["role"] == "user")
+        assert "What is RAG?" in user_message["content"]
+
+    def test_system_prompt_present_in_api_call(self):
+        generator, mock_client = build_generator()
+        mock_client.messages.create.return_value = make_text_response("Answer.")
+
+        generator.generate_response(query="Hello?")
+
+        call_kwargs = mock_client.messages.create.call_args.kwargs
+        assert "system" in call_kwargs
+        assert len(call_kwargs["system"]) > 0
+
+    def test_system_prompt_includes_conversation_history(self):
+        generator, mock_client = build_generator()
+        mock_client.messages.create.return_value = make_text_response("Answer.")
+
+        generator.generate_response(
+            query="Follow-up question?",
+            conversation_history="User: Hello\nAssistant: Hi!",
+        )
+
+        call_kwargs = mock_client.messages.create.call_args.kwargs
+        system = call_kwargs["system"]
+        assert "Hello" in system
+        assert "Hi!" in system
+
+    def test_no_tools_in_api_call_when_tools_not_provided(self):
+        generator, mock_client = build_generator()
+        mock_client.messages.create.return_value = make_text_response("Answer.")
+
+        generator.generate_response(query="General question?")
+
+        call_kwargs = mock_client.messages.create.call_args.kwargs
+        assert "tools" not in call_kwargs
+        assert "tool_choice" not in call_kwargs
+
+    def test_tools_included_when_provided(self):
+        generator, mock_client = build_generator()
+        mock_client.messages.create.return_value = make_text_response("Answer.")
+
+        generator.generate_response(query="Course question?", tools=SAMPLE_TOOLS)
+
+        call_kwargs = mock_client.messages.create.call_args.kwargs
+        assert "tools" in call_kwargs
+        assert call_kwargs["tool_choice"] == {"type": "auto"}
+
+
+# ---------------------------------------------------------------------------
+# Tests: tool-use path (two API calls)
+# ---------------------------------------------------------------------------
+
+class TestToolUsePath:
+
+    def test_two_api_calls_made_when_tool_invoked(self):
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("search_course_content", {"query": "lesson 5"})
+        second = make_text_response("Lesson 5 covered tool calling.")
+        mock_client.messages.create.side_effect = [first, second]
+
+        generator.generate_response(
+            query="What was covered in lesson 5 of MCP?",
+            tools=SAMPLE_TOOLS,
+            tool_manager=make_tool_manager(),
+        )
+
+        assert mock_client.messages.create.call_count == 2
+
+    def test_returns_text_from_second_api_call(self):
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("search_course_content", {"query": "lesson 5"})
+        second = make_text_response("Lesson 5 covered tool calling.")
+        mock_client.messages.create.side_effect = [first, second]
+
+        result = generator.generate_response(
+            query="What was covered in lesson 5 of MCP?",
+            tools=SAMPLE_TOOLS,
+            tool_manager=make_tool_manager(),
+        )
+
+        assert result == "Lesson 5 covered tool calling."
+
+    def test_calls_tool_manager_execute_for_search_content(self):
+        generator, mock_client = build_generator()
+        tool_input = {"query": "lesson 5 content", "course_name": "MCP", "lesson_number": 5}
+        first = make_tool_use_response("search_course_content", tool_input)
+        second = make_text_response("Answer.")
+        mock_client.messages.create.side_effect = [first, second]
+
+        tm = make_tool_manager()
+        generator.generate_response(
+            query="What was covered in lesson 5 of MCP?",
+            tools=SAMPLE_TOOLS,
+            tool_manager=tm,
+        )
+
+        tm.execute_tool.assert_called_once_with(
+            "search_course_content",
+            query="lesson 5 content",
+            course_name="MCP",
+            lesson_number=5,
+        )
+
+    def test_calls_tool_manager_execute_for_get_outline(self):
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("get_course_outline", {"course_title": "MCP"})
+        second = make_text_response("The MCP course has 5 lessons.")
+        mock_client.messages.create.side_effect = [first, second]
+
+        tm = make_tool_manager("Course: MCP\nLessons:\n  Lesson 1: Intro")
+        generator.generate_response(
+            query="What is the outline of MCP?",
+            tools=SAMPLE_TOOLS,
+            tool_manager=tm,
+        )
+
+        tm.execute_tool.assert_called_once_with("get_course_outline", course_title="MCP")
+
+    def test_tool_result_included_in_second_api_call_messages(self):
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("search_course_content", {"query": "lesson 5"}, tool_id="toolu_abc")
+        second = make_text_response("Final answer.")
+        mock_client.messages.create.side_effect = [first, second]
+
+        tm = make_tool_manager("Relevant content from lesson 5.")
+        generator.generate_response(
+            query="What was covered in lesson 5?",
+            tools=SAMPLE_TOOLS,
+            tool_manager=tm,
+        )
+
+        second_call_kwargs = mock_client.messages.create.call_args_list[1].kwargs
+        messages = second_call_kwargs["messages"]
+
+        # Find the tool_result entry
+        tool_result = None
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "tool_result":
+                        tool_result = item
+                        break
+
+        assert tool_result is not None
+        assert tool_result["tool_use_id"] == "toolu_abc"
+        assert tool_result["content"] == "Relevant content from lesson 5."
+
+    def test_second_api_call_has_no_tools_parameter(self):
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("search_course_content", {"query": "lesson 5"})
+        second = make_text_response("Answer.")
+        mock_client.messages.create.side_effect = [first, second]
+
+        generator.generate_response(
+            query="Lesson query?",
+            tools=SAMPLE_TOOLS,
+            tool_manager=make_tool_manager(),
+        )
+
+        second_call_kwargs = mock_client.messages.create.call_args_list[1].kwargs
+        assert "tools" not in second_call_kwargs
+        assert "tool_choice" not in second_call_kwargs
+
+    def test_no_tool_call_when_tool_manager_is_none(self):
+        """If tool_manager is None, tool_use response falls through to content[0].text."""
+        generator, mock_client = build_generator()
+        # stop_reason is tool_use but no tool_manager → tries to return content[0].text
+        # The content[0] is a ToolUseBlock (no .text attribute on our mock)
+        tool_block = make_tool_use_block("search_course_content", {"query": "test"})
+        response = MagicMock()
+        response.stop_reason = "tool_use"
+        response.content = [tool_block]
+        mock_client.messages.create.return_value = response
+
+        # MagicMock auto-creates .text so this won't raise — just verifies no second call
+        generator.generate_response(query="Test?", tools=SAMPLE_TOOLS, tool_manager=None)
+
+        assert mock_client.messages.create.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: edge cases that reveal latent bugs
+# ---------------------------------------------------------------------------
+
+class TestEdgeCases:
+
+    def test_empty_final_response_content_raises_descriptive_error(self):
+        """
+        When the Claude API returns empty content after tool use, a ValueError
+        with a descriptive message is raised (not a bare IndexError).
+        """
+        generator, mock_client = build_generator()
+        first = make_tool_use_response("search_course_content", {"query": "lesson 5"})
+        empty_response = MagicMock()
+        empty_response.stop_reason = "end_turn"
+        empty_response.content = []
+        mock_client.messages.create.side_effect = [first, empty_response]
+
+        with pytest.raises(ValueError, match="Unexpected response from Claude API after tool use"):
+            generator.generate_response(
+                query="What was covered in lesson 5?",
+                tools=SAMPLE_TOOLS,
+                tool_manager=make_tool_manager(),
+            )
+
+    def test_empty_direct_response_content_raises_descriptive_error(self):
+        """
+        When the Claude API returns empty content on the direct-answer path,
+        a ValueError with a descriptive message is raised.
+        """
+        generator, mock_client = build_generator()
+        empty_response = MagicMock()
+        empty_response.stop_reason = "end_turn"
+        empty_response.content = []
+        mock_client.messages.create.return_value = empty_response
+
+        with pytest.raises(ValueError, match="Unexpected response from Claude API"):
+            generator.generate_response(query="Hello?")
